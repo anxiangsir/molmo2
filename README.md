@@ -61,6 +61,7 @@ Huggingface models can be found [here](https://huggingface.co/collections/allena
   - [Data Pipeline](#data-pipeline)
   - [Message Trees](#message-trees)
   - [Packing](#packing)
+  - [Tracking Pipeline](#tracking-pipeline)
 
 # Setup
 ## Installation
@@ -597,6 +598,116 @@ sequence. This reduces padding and boosts training efficiency. Packing setup is 
 Packed examples use the **`subsegment_id`** to demark which tokens belong to which examples.
 When packing, the trainer will keep track a light-weight snapshot of the state of the packers and
 save it during checkpointing to allow proper recovery from checkpoints.
+
+## Tracking Pipeline
+
+This section explains the end-to-end logic for video point tracking — covering how data is structured,
+how training ensures point counts match frame counts, and how testing aligns predictions with extracted frames.
+
+### Overview
+
+Molmo2 supports video point tracking tasks (e.g., MeViS, DAVIS, LaSOT, TAP-Vid). The model receives a
+video and a text query (and optionally initial query points), then predicts the spatial location and
+occlusion state of the target objects at every sampled frame. The prediction output is formatted as
+structured text with per-frame timestamps:
+
+```
+time 0.50
+{0: [52.4, 40.7], 1: [52.4, 41.5]}
+time 1.00
+{0: [52.4, 40.7, yes], 1: [52.4, 41.5], 2: [52.8, 40.5, yes]}
+```
+
+Here each key is an object ID, each value is `[x, y]` (visible) or `[x, y, yes]` (occluded). Coordinates
+are in the range [0, 100] and scaled to pixel space during evaluation.
+
+### Key Question: Are the Number of Points Consistent with the Number of Frames?
+
+**Yes — both during training and testing, the number of annotation point-frames is always consistent with
+the number of video frames that the model actually sees.** This is enforced by a timestamp-based filtering
+mechanism described below.
+
+### Frame–Point Alignment Mechanism
+
+The alignment is handled by `_filter_frames_to_video()` in `olmo/preprocessing/data_formatter.py`.
+After a video is decoded, the extractor produces a `VideoFrames` object with exact per-frame timestamps.
+The data formatter then filters the annotation points to keep only those whose timestamps are within
+`eps=0.01` seconds of an actual extracted frame timestamp:
+
+```python
+# For each annotation frame, find the closest extracted video frame
+diff_matrix = np.abs(frame_times[:, None] - video_timestamps)   # shape: [n_annot_frames, n_video_frames]
+min_diffs = np.min(diff_matrix, axis=1)
+
+# Keep only annotation frames matched to a real video frame
+filtered_frames = [f for i, f in enumerate(frames_data) if min_diffs[i] < eps]
+```
+
+This guarantees a **one-to-one correspondence** between annotation point-frames and extracted video frames.
+
+### FPS Subsampling
+
+Datasets specify a `sampling_fps` field (e.g., 1 or 2 FPS). When this is set, `_sample_at_fps()` generates
+a regular timestamp grid at the target rate and calls `_filter_frames_to_video()` again to retain only
+annotation frames that align to those grid timestamps. The video decoder is similarly configured to
+extract frames at the matching rate. The result is that:
+
+- The model sees exactly `T = duration × sampling_fps` frames.
+- The annotation sequence contains exactly `T` point-frames (one per extracted frame).
+
+### Training
+
+During training each example is structured as follows:
+
+1. **Dataset loading** (`TrackingDataset.get()`): Loads the video path and per-frame annotation data.
+   Each annotation frame contains `{'frame': int, 'time': float, 'points': {object_id: {'point': [x,y], 'occluded': bool}}}`.
+
+2. **Formatting** (`format_video_object_track_points()`):
+   - `_filter_frames_to_video()` drops any annotation frames whose timestamp does not match an extracted frame.
+   - `_sample_at_fps()` (optional) further reduces to the target FPS grid.
+   - After filtering, `len(annotation_frames) == len(extracted_video_frames)`.
+   - `UnifiedPointFormatter.format_video_tracks()` serializes the aligned points into the text output.
+
+3. **Tokenisation and batching**: Video frames are encoded into patch tokens and concatenated with the
+   formatted text tokens. The model is trained with teacher-forcing on the serialised point text.
+
+**Result**: The number of annotation point-frames (i.e., the number of per-frame coordinate groups
+in the target text) always equals the number of video frames the model sees during training.
+
+### Testing / Evaluation
+
+During evaluation the same alignment pipeline is used:
+
+1. **Frame extraction**: Frames are decoded at the same `sampling_fps` as specified in the dataset config,
+   producing `T` frames and their exact timestamps.
+
+2. **Point filtering**: The ground-truth annotation is filtered with `_filter_frames_to_video()` to obtain
+   `T` reference point-frames aligned to the extracted frames.
+
+3. **Model inference**: The model generates text predictions covering each of the `T` frames.
+
+4. **Prediction parsing** (`PointTrackingParser.parse_prediction()`): Extracts per-frame, per-object
+   coordinates and occlusion flags from the generated text.
+
+5. **Array construction** (`create_pred_tracks_and_occlusions()`): Creates evaluation arrays of shape
+   `[num_objects, T, 2]` (positions) and `[num_objects, T]` (occlusion flags), where `T` is the number
+   of extracted frames.
+
+6. **Metrics** (`compute_tapvid_metrics()`): TAP-Vid metrics (AJ, OA, < δ_avg) are computed against the
+   ground-truth arrays, which have the same `T`-frame dimension.
+
+**Result**: The number of prediction slots always equals the number of extracted frames (`T`), matching
+the ground truth exactly.
+
+### Summary Table
+
+| Stage | Frames seen by model | Point annotations |
+|---|---|---|
+| **Training** | `T` extracted video frames (at `sampling_fps`) | `T` filtered annotation frames |
+| **Testing** | `T` extracted video frames (at `sampling_fps`) | `T` filtered ground-truth frames; `T` prediction slots |
+
+Both `T` values are determined by the same video-decoding + timestamp-filtering pipeline, so
+the counts are guaranteed to be consistent.
 
 # Citation
 
